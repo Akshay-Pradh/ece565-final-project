@@ -341,6 +341,9 @@ extern	void	sys_pd_exit(intmask, uint32);
 extern	void	zero_frame(uint32);
 extern  uint32  free_ffs_pages(void);
 
+extern	void	init_paging(void);
+extern 	void 	dump_pgtables(uint32 pd_addr);
+
 /* in file panic.c */
 extern	void	panic(char *);
 

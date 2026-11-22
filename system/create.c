@@ -55,6 +55,9 @@ pid32	create(
 	prptr->prdesc[1] = CONSOLE;
 	prptr->prdesc[2] = CONSOLE;
 
+	/* Set up page directory base register */
+	prptr->prpdbr = system_pd;
+
 	/* Initialize stack as if the process was called		*/
 
 	*saddr = STACKMAGIC;

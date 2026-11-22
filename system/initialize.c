@@ -222,6 +222,14 @@ static	void	sysinit()
 	for (i = 0; i < NDEVS; i++) {
 		init(i);
 	}
+
+	/* PAGING */
+	init_paging();
+	proctab[NULLPROC].prpdbr = system_pd;
+	set_evec(14, (uint32)pagefault_handler_disp);
+	write_cr3(system_pd);
+	enable_paging();
+
 	return;
 }
 

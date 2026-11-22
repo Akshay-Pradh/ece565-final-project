@@ -1,120 +1,148 @@
-/* main.c - Phase 1 test: frame allocators and zero_frame (paging OFF) */
+/* main.c - Phase 2 test: paging enabled, identity map, system processes */
 
 #include <xinu.h>
 
-extern uint32 pt_free, ffs_free;
+extern uint32 pt_free;		/* defined in paging.c */
+
+#define TRY_FAULT 1		/* set to 1 for the last test: deliberate fault */
 
 static int passed = 0, failed = 0;
+static volatile int child_ran = 0;
+static uint32 some_global = 0x12345678;
 
-#define CHECK(cond, msg)                                        \
-	do {                                                    \
+#define CHECK(cond, msg)                                              \
+	do {                                                          \
 		if (cond) { passed++; kprintf("  PASS  %s\n", msg); } \
 		else      { failed++; kprintf("  FAIL  %s\n", msg); } \
 	} while (0)
 
-process	main(void)
+/* Walk the current page tables in software: virtual -> physical.
+ * Returns 0xFFFFFFFF if the address isn't mapped. */
+static uint32 translate(uint32 va)
 {
-	uint32	a, b, c, d, f;
-	uint32	got[64];
-	uint32	*p;
-	int	i, ok, count;
+	uint32	old, pa = 0xFFFFFFFF;
+	intmask	mask;
+	pd_t	*pd;
+	pt_t	*pt;
+	uint32	pdi = va >> 22, pti = (va >> 12) & 0x3FF;
 
-	kprintf("\n===== Phase 1: frame allocator tests =====\n");
-	init_frame_pools();
-
-	/* ---- Starting state ---- */
-	kprintf("\n[start]\n");
-	CHECK(pt_free == MAX_PT_SIZE, "pt_free starts at MAX_PT_SIZE");
-	CHECK(ffs_free == MAX_FFS_SIZE, "ffs_free starts at MAX_FFS_SIZE");
-	CHECK(free_ffs_pages() == MAX_FFS_SIZE, "free_ffs_pages() matches");
-
-	/* ---- PT area: basic allocate / free / reuse ---- */
-	kprintf("\n[PT area]\n");
-	a = get_pt_frame();
-	b = get_pt_frame();
-	c = get_pt_frame();
-	kprintf("  got 0x%08x 0x%08x 0x%08x\n", a, b, c);
-	CHECK(a == PT_AREA_START, "first PT frame is PT_AREA_START");
-	CHECK(b == PT_AREA_START + PAGE_SIZE, "second PT frame is +4 KB");
-	CHECK(c == PT_AREA_START + 2 * PAGE_SIZE, "third PT frame is +8 KB");
-	CHECK(pt_free == MAX_PT_SIZE - 3, "pt_free dropped by 3");
-
-	CHECK(free_pt_frame(b) == OK, "free middle PT frame returns OK");
-	CHECK(pt_free == MAX_PT_SIZE - 2, "pt_free went back up by 1");
-	d = get_pt_frame();
-	CHECK(d == b, "next allocation reuses the freed frame");
-
-	CHECK(free_pt_frame(b) == OK, "free it again (legit)");
-	CHECK(free_pt_frame(b) == (uint32)SYSERR, "double free returns SYSERR");
-	CHECK(free_pt_frame(0x00001000) == (uint32)SYSERR, "free below PT area returns SYSERR");
-	CHECK(free_pt_frame(FFS_START) == (uint32)SYSERR, "free of an FFS address returns SYSERR");
-	free_pt_frame(a);
-	free_pt_frame(c);
-	CHECK(pt_free == MAX_PT_SIZE, "pt_free back to full");
-
-	/* ---- PT area: crossing word boundaries (bits 31/32 etc.) ---- */
-	kprintf("\n[PT area: 64 frames across bitmap words]\n");
-	ok = 1;
-	for (i = 0; i < 64; i++) {
-		got[i] = get_pt_frame();
-		if (got[i] != PT_AREA_START + i * PAGE_SIZE) {
-			ok = 0;
-			kprintf("  frame %d: expected 0x%08x got 0x%08x\n",
-				i, PT_AREA_START + i * PAGE_SIZE, got[i]);
+	mask = sys_pd_enter(&old);
+	pd = (pd_t *)old;			/* the PD that was loaded */
+	if (pd[pdi].pd_pres) {
+		pt = (pt_t *)(pd[pdi].pd_base << 12);
+		if (pt[pti].pt_pres) {
+			pa = (pt[pti].pt_base << 12) | (va & 0xFFF);
 		}
 	}
-	CHECK(ok, "64 frames come out in order (checks bit 31 -> bit 0 of next word)");
-	for (i = 0; i < 64; i++) {
-		free_pt_frame(got[i]);
-	}
-	CHECK(pt_free == MAX_PT_SIZE, "pt_free back to full after freeing 64");
+	sys_pd_exit(mask, old);
+	return pa;
+}
 
-	/* ---- PT area: exhaust the pool ---- */
-	kprintf("\n[PT area: exhaust]\n");
-	count = 0;
-	while (get_pt_frame() != (uint32)SYSERR) {
-		count++;
-	}
-	CHECK(count == MAX_PT_SIZE, "exactly MAX_PT_SIZE frames handed out");
-	CHECK(pt_free == 0, "pt_free is 0 when empty");
-	CHECK(get_pt_frame() == (uint32)SYSERR, "allocation on empty pool returns SYSERR");
-	for (i = 0; i < MAX_PT_SIZE; i++) {
-		free_pt_frame(PT_AREA_START + i * PAGE_SIZE);
-	}
-	CHECK(pt_free == MAX_PT_SIZE, "pt_free back to full after freeing all");
+static process child(void)
+{
+	child_ran = 1;
+	return OK;
+}
 
-	/* ---- FFS: same basics ---- */
-	kprintf("\n[FFS]\n");
-	a = get_ffs_frame();
-	b = get_ffs_frame();
-	kprintf("  got 0x%08x 0x%08x\n", a, b);
-	CHECK(a == FFS_START, "first FFS frame is FFS_START");
-	CHECK(b == FFS_START + PAGE_SIZE, "second FFS frame is +4 KB");
-	CHECK(free_ffs_pages() == MAX_FFS_SIZE - 2, "free_ffs_pages dropped by 2");
-	CHECK(free_ffs_frame(a) == OK, "free first FFS frame returns OK");
-	CHECK(get_ffs_frame() == a, "next allocation reuses it");
-	CHECK(free_ffs_frame(PT_AREA_START) == (uint32)SYSERR, "free of a PT address returns SYSERR");
+process	main(void)
+{
+	uint32	old, f, *p;
+	intmask	mask;
+	pd_t	*pd;
+	pt_t	*pt;
+	int	s, i, ok;
+	uint32	npde = VHEAP_START >> 22;
+	pid32	cpid;
 
-	/* ---- zero_frame on real FFS memory (paging is off, physical access) ---- */
-	kprintf("\n[zero_frame]\n");
-	f = b;
-	p = (uint32 *)f;
-	for (i = 0; i < PAGE_SIZE / 4; i++) {
-		p[i] = 0xDEADBEEF;
-	}
-	CHECK(p[0] == 0xDEADBEEF && p[PAGE_SIZE/4 - 1] == 0xDEADBEEF,
-	      "can write to FFS memory (VM has enough RAM)");
-	zero_frame(f);
+	kprintf("\n===== Phase 2: paging tests =====\n");
+
+	/* ---- Control registers ---- */
+	kprintf("\n[control registers]\n");
+	CHECK(read_cr0() & 0x80000000, "CR0.PG (bit 31) is set");
+	CHECK(read_cr3() == system_pd, "CR3 holds system_pd");
+	CHECK(current_pd == system_pd, "current_pd == system_pd");
+
+	/* ---- Process table ---- */
+	kprintf("\n[process table]\n");
+	CHECK(proctab[NULLPROC].prpdbr == system_pd, "null process uses system_pd");
+	CHECK(proctab[currpid].prpdbr == system_pd, "main (made by create) uses system_pd");
+
+	/* ---- Frame accounting ---- */
+	kprintf("\n[frame accounting]\n");
+	kprintf("  pt_free = %d (expect %d)\n", pt_free, MAX_PT_SIZE - 1 - npde);
+	CHECK(pt_free == MAX_PT_SIZE - 1 - npde, "PD + one PT per 4 MB slice used");
+	CHECK(free_ffs_pages() == MAX_FFS_SIZE, "no FFS frames used yet");
+
+	/* ---- Table contents: full identity map, nothing else ---- */
+	kprintf("\n[table contents]\n");
+	mask = sys_pd_enter(&old);
+	pd = (pd_t *)system_pd;
 	ok = 1;
-	for (i = 0; i < PAGE_SIZE / 4; i++) {
-		if (p[i] != 0) { ok = 0; break; }
+	for (s = 0; s < (int)npde && ok; s++) {
+		if (!pd[s].pd_pres) { ok = 0; kprintf("  PDE %d not present\n", s); break; }
+		pt = (pt_t *)(pd[s].pd_base << 12);
+		for (i = 0; i < 1024; i++) {
+			if (!pt[i].pt_pres || pt[i].pt_base != (uint32)(s * 1024 + i)
+			    || (pt[i].pt_avail & VALID_BIT)) {
+				ok = 0;
+				kprintf("  PDE %d PTE %d wrong (base 0x%x)\n", s, i, pt[i].pt_base);
+				break;
+			}
+		}
 	}
-	CHECK(ok, "zero_frame cleared the whole 4 KB");
+	sys_pd_exit(mask, old);
+	CHECK(ok, "PDEs 0..npde-1: every PTE present, page N -> frame N, valid bit clear");
 
-	free_ffs_frame(a);
-	free_ffs_frame(b);
-	CHECK(free_ffs_pages() == MAX_FFS_SIZE, "FFS back to full");
+	mask = sys_pd_enter(&old);
+	ok = 1;
+	for (s = npde; s < 1024; s++) {
+		if (pd[s].pd_pres) { ok = 0; kprintf("  PDE %d unexpectedly present\n", s); break; }
+	}
+	sys_pd_exit(mask, old);
+	CHECK(ok, "PDEs from VHEAP_START up are not present");
+
+	/* ---- Translation spot checks ---- */
+	kprintf("\n[translation]\n");
+	CHECK(translate((uint32)main) == (uint32)main, "code address maps to itself");
+	CHECK(translate((uint32)&some_global) == (uint32)&some_global, "global variable maps to itself");
+	CHECK(translate((uint32)&ok) == (uint32)&ok, "stack variable maps to itself");
+	CHECK(translate(PT_AREA_START) == PT_AREA_START, "PD/PT area start maps to itself");
+	CHECK(translate(FFS_START + MAX_FFS_SIZE * PAGE_SIZE - 4) ==
+	      FFS_START + MAX_FFS_SIZE * PAGE_SIZE - 4, "last word of FFS maps to itself");
+	CHECK(translate(VHEAP_START) == 0xFFFFFFFF, "VHEAP_START is not mapped");
+
+	/* ---- Memory access through paging ---- */
+	kprintf("\n[memory access]\n");
+	CHECK(some_global == 0x12345678, "global variable readable");
+	f = get_ffs_frame();
+	p = (uint32 *)f;
+	p[0] = 0xCAFEBABE;
+	p[PAGE_SIZE / 4 - 1] = 0xFEEDFACE;
+	CHECK(p[0] == 0xCAFEBABE && p[PAGE_SIZE / 4 - 1] == 0xFEEDFACE,
+	      "write/read an FFS frame with paging on");
+	zero_frame(f);
+	CHECK(p[0] == 0, "zero_frame works with paging on");
+	free_ffs_frame(f);
+
+	/* ---- Scheduling and interrupts still work ---- */
+	kprintf("\n[processes and clock]\n");
+	cpid = create(child, 1024, 20, "child", 0);
+	CHECK(cpid != SYSERR, "create() works");
+	CHECK(proctab[cpid].prpdbr == system_pd, "child gets system_pd");
+	resume(cpid);
+	sleepms(50);			/* needs the clock interrupt */
+	CHECK(child_ran, "child ran and main woke up from sleep (clock + resched OK)");
+
+	/* ---- Full dump for eyeballing ---- */
+	dump_pgtables(system_pd);
 
 	kprintf("\n===== %d passed, %d failed =====\n", passed, failed);
+
+#if TRY_FAULT
+	kprintf("\nTouching VHEAP_START on purpose; expect the stub's PAGE FAULT message...\n");
+	*(volatile uint32 *)VHEAP_START = 1;
+	kprintf("FAIL: no fault happened\n");
+#endif
+
 	return OK;
 }
