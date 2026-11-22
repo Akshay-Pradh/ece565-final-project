@@ -330,6 +330,17 @@ extern 	void	pagefault_handler(void);
 /* in file pagefault_handler_disp.S */
 extern	void	pagefault_handler_disp(void);
 
+/* in file paging.c*/
+extern	void	init_frame_pools(void);
+extern	uint32	get_pt_frame(void);
+extern	uint32	free_pt_frame(uint32);
+extern	uint32	get_ffs_frame(void);
+extern	uint32	free_ffs_frame(uint32);
+extern	intmask	sys_pd_enter(uint32 *);
+extern	void	sys_pd_exit(intmask, uint32);
+extern	void	zero_frame(uint32);
+extern  uint32  free_ffs_pages(void);
+
 /* in file panic.c */
 extern	void	panic(char *);
 
