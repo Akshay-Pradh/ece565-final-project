@@ -321,6 +321,15 @@ extern	qid16	newqueue(void);
 /* in file open.c */
 extern	syscall	open(did32, char *, char *);
 
+/* in file pagefault_handler.c */
+extern	void	pagefault_handler(void);
+
+/* in file pagefault_handler.S */
+extern 	void	pagefault_handler(void);
+
+/* in file pagefault_handler_disp.S */
+extern	void	pagefault_handler_disp(void);
+
 /* in file panic.c */
 extern	void	panic(char *);
 
