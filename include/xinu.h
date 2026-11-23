@@ -2,11 +2,11 @@
 
 #include <kernel.h>
 #include <conf.h>
+#include <paging.h>
 #include <process.h>
 #include <queue.h>
 #include <resched.h>
 #include <mark.h>
-#include <paging.h>
 #include <semaphore.h>
 #include <memory.h>
 #include <bufpool.h>

@@ -40,6 +40,13 @@ void	resched(void)		/* Assumes interrupts are disabled	*/
 	currpid = dequeue(readylist);
 	ptnew = &proctab[currpid];
 	ptnew->prstate = PR_CURR;
+
+	/* Switch address space if the new process uses a different PD */
+	if (ptnew->prpdbr != current_pd) {
+		current_pd = ptnew->prpdbr;
+		write_cr3(current_pd);
+	}
+
 	preempt = QUANTUM;		/* Reset time slice for process	*/
 	ctxsw(&ptold->prstkptr, &ptnew->prstkptr);
 

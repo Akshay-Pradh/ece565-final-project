@@ -340,7 +340,11 @@ extern	intmask	sys_pd_enter(uint32 *);
 extern	void	sys_pd_exit(intmask, uint32);
 extern	void	zero_frame(uint32);
 extern  uint32  free_ffs_pages(void);
+extern void   free_user_memory(pid32);
+extern uint32 allocated_virtual_pages(pid32);
+extern uint32 used_ffs_frames(pid32);
 
+/* ====== main functions ====== */
 extern	void	init_paging(void);
 extern 	void 	dump_pgtables(uint32 pd_addr);
 
@@ -626,6 +630,9 @@ extern	syscall	unsleep(pid32);
 
 /* in file userret.c */
 extern	void	userret(void);
+
+/* in file vcreate.c */
+extern pid32 vcreate(void *, uint32, pri16, char *, uint32, ...);
 
 /* in file wait.c */
 extern	syscall	wait(sid32);

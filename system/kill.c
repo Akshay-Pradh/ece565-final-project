@@ -29,6 +29,12 @@ syscall	kill(
 	for (i=0; i<3; i++) {
 		close(prptr->prdesc[i]);
 	}
+
+	/* release user's process frames before killed */
+	if (prptr->pruser) {
+		free_user_memory(pid);
+	}
+
 	freestk(prptr->prstkbase, prptr->prstklen);
 
 	switch (prptr->prstate) {

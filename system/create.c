@@ -58,6 +58,12 @@ pid32	create(
 	/* Set up page directory base register */
 	prptr->prpdbr = system_pd;
 
+	/* Initialize rest of paging parameters */
+	prptr->pruser = FALSE;
+	prptr->prvfree = NULL;
+	prptr->prvpages = 0;
+	prptr->prffs = 0;
+
 	/* Initialize stack as if the process was called		*/
 
 	*saddr = STACKMAGIC;

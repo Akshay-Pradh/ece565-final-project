@@ -52,7 +52,13 @@ struct procent {		/* Entry in the process table		*/
 	umsg32	prmsg;		/* Message sent to this process		*/
 	bool8	prhasmsg;	/* Nonzero iff msg is valid		*/
 	int16	prdesc[NDESC];	/* Device descriptors for process	*/
+
+	/* PAGING FIELDS */
 	uint32	prpdbr;		/* Process page directory base register */
+	bool8	pruser;		/* TRUE if created with vcreate */
+	vblock_t *prvfree;	/* Free list of virtual heap ranges */
+	uint32	prvpages;	/* virtual pages currently allocated */
+	uint32 	prffs;		/* FFS frames currently in use */
 };
 
 /* Marker for the top of a process stack (used to help detect overflow)	*/

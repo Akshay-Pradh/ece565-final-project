@@ -1,14 +1,10 @@
-/* main.c - Phase 2 test: paging enabled, identity map, system processes */
+/* main.c - Phase 3 test: vcreate, resched CR3 switch, kill cleanup */
 
 #include <xinu.h>
 
-extern uint32 pt_free;		/* defined in paging.c */
-
-#define TRY_FAULT 1		/* set to 1 for the last test: deliberate fault */
+extern uint32 pt_free;			/* defined in paging.c */
 
 static int passed = 0, failed = 0;
-static volatile int child_ran = 0;
-static uint32 some_global = 0x12345678;
 
 #define CHECK(cond, msg)                                              \
 	do {                                                          \
@@ -16,133 +12,188 @@ static uint32 some_global = 0x12345678;
 		else      { failed++; kprintf("  FAIL  %s\n", msg); } \
 	} while (0)
 
-/* Walk the current page tables in software: virtual -> physical.
- * Returns 0xFFFFFFFF if the address isn't mapped. */
-static uint32 translate(uint32 va)
+/* Results reported back by the user processes */
+static volatile int	u_ran = 0, u_cr3_ok = 0, u_global_ok = 0;
+static volatile int	loop_bad = 0, loop_done = 0;
+static volatile int	nested_ran = 0, nested_cr3_ok = 0;
+static volatile pid32	nested_pid = SYSERR;
+static uint32		shared_value = 0xA5A5A5A5;
+
+/* ---- User process bodies ---- */
+
+process simple_user(void)
 {
-	uint32	old, pa = 0xFFFFFFFF;
+	u_ran = 1;
+	u_cr3_ok = (read_cr3() == proctab[getpid()].prpdbr) &&
+		   (current_pd == proctab[getpid()].prpdbr);
+	u_global_ok = (shared_value == 0xA5A5A5A5);	/* kernel data visible */
+	kprintf("    [user %d] hello from a user process, CR3 = 0x%08x\n",
+		getpid(), read_cr3());
+	return OK;
+}
+
+process loop_user(int id)
+{
+	int i;
+	for (i = 0; i < 5; i++) {
+		if (read_cr3() != proctab[getpid()].prpdbr) {
+			loop_bad++;
+		}
+		kprintf("    [user %d] iteration %d\n", id, i);
+		sleepms(10);			/* force context switches */
+	}
+	loop_done++;
+	return OK;
+}
+
+process sleeper_user(void)
+{
+	sleepms(100000);			/* main kills us long before this */
+	return OK;
+}
+
+process nested_child(void)
+{
+	nested_ran = 1;
+	nested_cr3_ok = (read_cr3() == proctab[getpid()].prpdbr);
+	return OK;
+}
+
+process nested_parent(void)
+{
+	/* vcreate called from USER context: the CR3-switch helper must work */
+	nested_pid = vcreate(nested_child, 8192, 30, "nchild", 0);
+	if (nested_pid != SYSERR) {
+		resume(nested_pid);
+		sleepms(20);
+	}
+	return OK;
+}
+
+/* ---- Helpers ---- */
+
+/* Check a user PD: 0..7 share the system PTs, everything else empty */
+static int check_user_pd(uint32 pd_addr)
+{
+	uint32	old;
 	intmask	mask;
-	pd_t	*pd;
-	pt_t	*pt;
-	uint32	pdi = va >> 22, pti = (va >> 12) & 0x3FF;
+	pd_t	*upd, *spd;
+	int	i, ok = 1;
+	int	nk = XINU_PAGES / 1024;
 
 	mask = sys_pd_enter(&old);
-	pd = (pd_t *)old;			/* the PD that was loaded */
-	if (pd[pdi].pd_pres) {
-		pt = (pt_t *)(pd[pdi].pd_base << 12);
-		if (pt[pti].pt_pres) {
-			pa = (pt[pti].pt_base << 12) | (va & 0xFFF);
+	upd = (pd_t *)pd_addr;
+	spd = (pd_t *)system_pd;
+	for (i = 0; i < nk; i++) {
+		if (!upd[i].pd_pres || upd[i].pd_base != spd[i].pd_base) {
+			kprintf("    PDE %d does not match system PD\n", i);
+			ok = 0;
+		}
+	}
+	for (i = nk; i < 1024; i++) {
+		if (upd[i].pd_pres) {
+			kprintf("    PDE %d unexpectedly present\n", i);
+			ok = 0;
 		}
 	}
 	sys_pd_exit(mask, old);
-	return pa;
-}
-
-static process child(void)
-{
-	child_ran = 1;
-	return OK;
+	return ok;
 }
 
 process	main(void)
 {
-	uint32	old, f, *p;
-	intmask	mask;
-	pd_t	*pd;
-	pt_t	*pt;
-	int	s, i, ok;
-	uint32	npde = VHEAP_START >> 22;
-	pid32	cpid;
+	pid32		pid, p1, p2;
+	uint32		pt_before;
+	struct procent	*prptr;
+	int		i;
 
-	kprintf("\n===== Phase 2: paging tests =====\n");
+	kprintf("\n===== Phase 3: user process tests =====\n");
 
-	/* ---- Control registers ---- */
-	kprintf("\n[control registers]\n");
-	CHECK(read_cr0() & 0x80000000, "CR0.PG (bit 31) is set");
-	CHECK(read_cr3() == system_pd, "CR3 holds system_pd");
-	CHECK(current_pd == system_pd, "current_pd == system_pd");
+	/* ---- 1. vcreate sets up a correct process entry and PD ---- */
+	kprintf("\n[vcreate]\n");
+	pt_before = pt_free;
+	pid = vcreate(simple_user, 8192, 30, "user1", 0);
+	CHECK(pid != SYSERR, "vcreate returns a pid");
+	prptr = &proctab[pid];
+	CHECK(pt_free == pt_before - 1, "exactly one PD/PT frame used (the PD)");
+	CHECK(prptr->pruser == TRUE, "pruser is TRUE");
+	CHECK(prptr->prpdbr != system_pd && prptr->prpdbr >= PT_AREA_START
+	      && prptr->prpdbr < FFS_START, "prpdbr is its own frame in the PD/PT area");
+	CHECK(check_user_pd(prptr->prpdbr), "user PD: PDEs 0..7 shared, rest not present");
+	CHECK(prptr->prvfree != NULL && prptr->prvfree->start == VHEAP_START,
+	      "free list starts at VHEAP_START");
+	CHECK(prptr->prvfree->npages == 1048576 - VHEAP_START / PAGE_SIZE,
+	      "free list covers the whole heap (1,022,976 pages)");
+	CHECK(prptr->prvfree->next == NULL, "free list has a single node");
+	CHECK(allocated_virtual_pages(pid) == 0 && used_ffs_frames(pid) == 0,
+	      "debug counters start at 0");
+	dump_pgtables(prptr->prpdbr);
 
-	/* ---- Process table ---- */
-	kprintf("\n[process table]\n");
-	CHECK(proctab[NULLPROC].prpdbr == system_pd, "null process uses system_pd");
-	CHECK(proctab[currpid].prpdbr == system_pd, "main (made by create) uses system_pd");
+	/* ---- 2. It runs on its own PD and can still use kernel memory ---- */
+	kprintf("\n[running a user process]\n");
+	resume(pid);
+	sleepms(50);
+	CHECK(u_ran, "user process ran");
+	CHECK(u_cr3_ok, "CR3 and current_pd were its own PD while it ran");
+	CHECK(u_global_ok, "it could read kernel globals (shared mapping)");
+	CHECK(read_cr3() == system_pd, "main is back on system_pd afterwards");
 
-	/* ---- Frame accounting ---- */
-	kprintf("\n[frame accounting]\n");
-	kprintf("  pt_free = %d (expect %d)\n", pt_free, MAX_PT_SIZE - 1 - npde);
-	CHECK(pt_free == MAX_PT_SIZE - 1 - npde, "PD + one PT per 4 MB slice used");
-	CHECK(free_ffs_pages() == MAX_FFS_SIZE, "no FFS frames used yet");
+	/* ---- 3. Exiting normally frees the PD ---- */
+	kprintf("\n[cleanup on normal exit]\n");
+	CHECK(pt_free == pt_before, "PD frame returned after the process returned");
+	CHECK(proctab[pid].prstate == PR_FREE, "process slot is free");
 
-	/* ---- Table contents: full identity map, nothing else ---- */
-	kprintf("\n[table contents]\n");
-	mask = sys_pd_enter(&old);
-	pd = (pd_t *)system_pd;
-	ok = 1;
-	for (s = 0; s < (int)npde && ok; s++) {
-		if (!pd[s].pd_pres) { ok = 0; kprintf("  PDE %d not present\n", s); break; }
-		pt = (pt_t *)(pd[s].pd_base << 12);
-		for (i = 0; i < 1024; i++) {
-			if (!pt[i].pt_pres || pt[i].pt_base != (uint32)(s * 1024 + i)
-			    || (pt[i].pt_avail & VALID_BIT)) {
-				ok = 0;
-				kprintf("  PDE %d PTE %d wrong (base 0x%x)\n", s, i, pt[i].pt_base);
-				break;
-			}
-		}
+	/* ---- 4. Two user processes + main interleaving ---- */
+	kprintf("\n[context switching between user processes]\n");
+	pt_before = pt_free;
+	p1 = vcreate(loop_user, 8192, 20, "loop1", 1, 1);
+	p2 = vcreate(loop_user, 8192, 20, "loop2", 1, 2);
+	CHECK(p1 != SYSERR && p2 != SYSERR, "two vcreates succeed");
+	CHECK(proctab[p1].prpdbr != proctab[p2].prpdbr, "they get different PDs");
+	resume(p1);
+	resume(p2);
+	for (i = 0; i < 5; i++) {
+		if (read_cr3() != system_pd) loop_bad++;
+		kprintf("    [main] iteration %d\n", i);
+		sleepms(10);
 	}
-	sys_pd_exit(mask, old);
-	CHECK(ok, "PDEs 0..npde-1: every PTE present, page N -> frame N, valid bit clear");
+	sleepms(100);
+	CHECK(loop_done == 2, "both loop processes finished");
+	CHECK(loop_bad == 0, "every process always ran on its own PD");
+	CHECK(pt_free == pt_before, "both PDs returned");
 
-	mask = sys_pd_enter(&old);
-	ok = 1;
-	for (s = npde; s < 1024; s++) {
-		if (pd[s].pd_pres) { ok = 0; kprintf("  PDE %d unexpectedly present\n", s); break; }
+	/* ---- 5. Killing a sleeping user process from main ---- */
+	kprintf("\n[kill another process]\n");
+	pt_before = pt_free;
+	pid = vcreate(sleeper_user, 8192, 20, "sleeper", 0);
+	resume(pid);
+	sleepms(20);				/* let it go to sleep */
+	CHECK(kill(pid) == OK, "kill returns OK");
+	CHECK(read_cr3() == system_pd && current_pd == system_pd,
+	      "main still on its own PD after killing someone else");
+	CHECK(pt_free == pt_before, "victim's PD returned");
+
+	/* ---- 6. vcreate called from inside a user process ---- */
+	kprintf("\n[vcreate from user context]\n");
+	pt_before = pt_free;
+	pid = vcreate(nested_parent, 8192, 20, "nparent", 0);
+	resume(pid);
+	sleepms(100);
+	CHECK(nested_pid != SYSERR, "user process could vcreate another");
+	CHECK(nested_ran && nested_cr3_ok, "nested child ran on its own PD");
+	CHECK(pt_free == pt_before, "both PDs returned");
+
+	/* ---- 7. Leak check: many create/kill cycles ---- */
+	kprintf("\n[leak check: 50 vcreate + kill]\n");
+	pt_before = pt_free;
+	for (i = 0; i < 50; i++) {
+		pid = vcreate(simple_user, 8192, 20, "cycle", 0);
+		if (pid == SYSERR) { kprintf("    vcreate failed at %d\n", i); break; }
+		kill(pid);			/* never resumed */
 	}
-	sys_pd_exit(mask, old);
-	CHECK(ok, "PDEs from VHEAP_START up are not present");
-
-	/* ---- Translation spot checks ---- */
-	kprintf("\n[translation]\n");
-	CHECK(translate((uint32)main) == (uint32)main, "code address maps to itself");
-	CHECK(translate((uint32)&some_global) == (uint32)&some_global, "global variable maps to itself");
-	CHECK(translate((uint32)&ok) == (uint32)&ok, "stack variable maps to itself");
-	CHECK(translate(PT_AREA_START) == PT_AREA_START, "PD/PT area start maps to itself");
-	CHECK(translate(FFS_START + MAX_FFS_SIZE * PAGE_SIZE - 4) ==
-	      FFS_START + MAX_FFS_SIZE * PAGE_SIZE - 4, "last word of FFS maps to itself");
-	CHECK(translate(VHEAP_START) == 0xFFFFFFFF, "VHEAP_START is not mapped");
-
-	/* ---- Memory access through paging ---- */
-	kprintf("\n[memory access]\n");
-	CHECK(some_global == 0x12345678, "global variable readable");
-	f = get_ffs_frame();
-	p = (uint32 *)f;
-	p[0] = 0xCAFEBABE;
-	p[PAGE_SIZE / 4 - 1] = 0xFEEDFACE;
-	CHECK(p[0] == 0xCAFEBABE && p[PAGE_SIZE / 4 - 1] == 0xFEEDFACE,
-	      "write/read an FFS frame with paging on");
-	zero_frame(f);
-	CHECK(p[0] == 0, "zero_frame works with paging on");
-	free_ffs_frame(f);
-
-	/* ---- Scheduling and interrupts still work ---- */
-	kprintf("\n[processes and clock]\n");
-	cpid = create(child, 1024, 20, "child", 0);
-	CHECK(cpid != SYSERR, "create() works");
-	CHECK(proctab[cpid].prpdbr == system_pd, "child gets system_pd");
-	resume(cpid);
-	sleepms(50);			/* needs the clock interrupt */
-	CHECK(child_ran, "child ran and main woke up from sleep (clock + resched OK)");
-
-	/* ---- Full dump for eyeballing ---- */
-	dump_pgtables(system_pd);
+	CHECK(i == 50, "all 50 vcreates succeeded");
+	CHECK(pt_free == pt_before, "no PD/PT frames leaked");
 
 	kprintf("\n===== %d passed, %d failed =====\n", passed, failed);
-
-#if TRY_FAULT
-	kprintf("\nTouching VHEAP_START on purpose; expect the stub's PAGE FAULT message...\n");
-	*(volatile uint32 *)VHEAP_START = 1;
-	kprintf("FAIL: no fault happened\n");
-#endif
-
 	return OK;
 }
